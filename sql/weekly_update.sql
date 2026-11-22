@@ -7,7 +7,7 @@
 -- 结果摘要显示在下方的 Messages 标签页。
 --
 -- 所有清洗规则都在这个文件里。改了规则（清洗规则、品类关键词、检查项），改这个文件再运行就生效；
--- 已有的数据不会被删除或覆盖。
+-- 已有的数据不会被删除或覆盖（每次运行会先删掉再重建视图和流程，视图不存数据）。
 --
 -- 加载前会检查，有问题的批次不加载，标记为 flagged：
 --   日期不够新 / 新编码有多个描述 / 已有商品描述不同 / 没有任何有效行 / 处理失败
@@ -64,13 +64,16 @@ BEGIN
 END $$;
 
 
+
 -- =========================================================================
 -- 2. 清洗规则（视图）
 -- 规则的依据见 Retail_Analysis.Rmd。改了规则，重新执行这个文件就生效。
 -- =========================================================================
 -- (1) 批次内完全相同的行只留一行（Retail_Analysis.Rmd 2.1）
 --     统一大小写和空白，剔除坏账（Retail_Analysis.Rmd 2.2）
-CREATE OR REPLACE VIEW stg.sales_normalized AS
+DROP VIEW IF EXISTS stg.sales_final;        -- 依赖 sales_normalized，先删
+DROP VIEW IF EXISTS stg.sales_normalized;
+CREATE VIEW stg.sales_normalized AS
 WITH batch AS (
   SELECT file, sheet, status
   FROM raw.load_log
@@ -101,7 +104,8 @@ WHERE coalesce(d.description, '') !~* 'bad debt';
 -- (2) 用主档的标准名补全缺失或占位的描述（Retail_Analysis.Rmd 3.1）
 --     业务规则：只保留商品的正常销售（Quantity > 0）和退货或取消（Quantity < 0）（Retail_Analysis.Rmd 3.3）
 --     事实表需要的字段（Retail_Analysis.Rmd Step 4）
-CREATE OR REPLACE VIEW stg.sales_final AS
+DROP VIEW IF EXISTS stg.sales_final;
+CREATE VIEW stg.sales_final AS
 WITH named AS (
   SELECT n.*,
          p.standard_description,
@@ -110,11 +114,11 @@ WITH named AS (
               ELSE n.description END AS description_filled
   FROM stg.sales_normalized n
   LEFT JOIN mart.dim_product p USING (stock_code)
-  WHERE n.status IN ('ready', 'confirmed')     -- 被标记 (flagged) 的批次不处理
 )
 SELECT DISTINCT
        file,
        sheet,
+       status,                                      -- 写入事实表时只取 ready / confirmed；批次检查的诊断用 new
        invoice,
        stock_code,
        customer_id,
@@ -145,7 +149,8 @@ WHERE quantity <> 0
 -- =========================================================================
 -- 3. 数据质量检查（视图）
 -- =========================================================================
-CREATE OR REPLACE VIEW ops.v_dq_checks AS
+DROP VIEW IF EXISTS ops.v_dq_checks;
+CREATE VIEW ops.v_dq_checks AS
 WITH c AS (
   -- Range：取值范围
   SELECT 'Range' AS category, 'Price > 0' AS check_name, 'FAIL' AS severity, count(*) FILTER (WHERE price <= 0) AS n FROM mart.fact_sales
@@ -290,7 +295,7 @@ BEGIN
     SELECT n.file, n.sheet,
            count(f.invoice)            AS rows_dup,
            count(*) - count(f.invoice) AS rows_new
-    FROM stg.sales_normalized n
+    FROM stg.sales_final n                       -- 用清洗规则之后的行：只数真正会进事实表的行
     LEFT JOIN mart.fact_sales f
       ON  f.invoice = n.invoice
       AND f.stock_code = n.stock_code
@@ -298,7 +303,7 @@ BEGIN
       AND f.invoice_date = n.invoice_date
       AND f.quantity = n.quantity
       AND f.price = n.price
-    WHERE n.status = 'new' AND n.quantity <> 0 AND n.price > 0
+    WHERE n.status = 'new'
     GROUP BY n.file, n.sheet
   ),
   inv AS (
@@ -393,7 +398,7 @@ BEGIN
   -- (1) 有商品没有任何名称（这个编码从来没有过有效描述）：停下
   SELECT string_agg(DISTINCT stock_code, ', ') INTO v_missing
   FROM stg.sales_final
-  WHERE standard_description IS NULL;
+  WHERE status IN ('ready', 'confirmed') AND standard_description IS NULL;
 
   IF v_missing IS NOT NULL THEN
     RAISE EXCEPTION '以下 StockCode 在商品主档里没有名称：%。请和上游或商品负责人确认名称，用 SELECT ops.set_product_name(...) 写进主档、用 ops.confirm_batch() 确认批次后，再运行一次 weekly_update.sql。', v_missing;
@@ -417,7 +422,7 @@ BEGIN
     FROM stg.sales_normalized WHERE status IN ('ready', 'confirmed')
     UNION ALL
     SELECT file, sheet, '3.3 业务规则', quantity, price
-    FROM stg.sales_final
+    FROM stg.sales_final WHERE status IN ('ready', 'confirmed')
   ) s
   GROUP BY file, sheet, step;
 
@@ -428,6 +433,7 @@ BEGIN
     SELECT invoice, stock_code, customer_id, country, invoice_date, date_key,
            quantity, price, line_amount, is_return, is_anonymous, file, sheet
     FROM stg.sales_final
+    WHERE status IN ('ready', 'confirmed')     -- 被标记 (flagged) 和还没检查 (new) 的批次不写入
     ORDER BY file, sheet
     ON CONFLICT ON CONSTRAINT uq_order_line DO NOTHING
     RETURNING file, sheet, quantity, price
@@ -576,7 +582,8 @@ END $proc$;
 -- =========================================================================
 
 -- 所有批次（最新的在前）
-CREATE OR REPLACE VIEW ops.v_batches AS
+DROP VIEW IF EXISTS ops.v_batches;
+CREATE VIEW ops.v_batches AS
 SELECT regexp_replace(file, '^.*/', '') AS file, status, rows_raw, rows_loaded, note,
        batch_first_month, batch_last_month, fact_latest_month,
        rows_already_in_fact, rows_new, invoices_already_in_fact,
@@ -585,7 +592,8 @@ FROM raw.load_log
 ORDER BY ingested_at DESC;
 
 -- 还没处理的问题（被标记批次的问题明细）
-CREATE OR REPLACE VIEW ops.v_open_issues AS
+DROP VIEW IF EXISTS ops.v_open_issues;
+CREATE VIEW ops.v_open_issues AS
 SELECT regexp_replace(b.file, '^.*/', '') AS file, b.issue, b.stock_code, b.master_name,
        b.batch_descriptions, b.logged_at, b.file AS full_path
 FROM ops.batch_issues b
@@ -594,13 +602,15 @@ WHERE l.status = 'flagged'
 ORDER BY b.file, b.issue, b.stock_code;
 
 -- 最近一次成功运行的清洗漏斗、新增商品
-CREATE OR REPLACE VIEW ops.v_last_run_funnel AS
+DROP VIEW IF EXISTS ops.v_last_run_funnel;
+CREATE VIEW ops.v_last_run_funnel AS
 SELECT regexp_replace(file, '^.*/', '') AS file, step, rows, sales_amt, return_amt
 FROM ops.cleaning_funnel
 WHERE logged_at >= (SELECT max(started_at) FROM ops.run_log WHERE result = '成功')
 ORDER BY file, step;
 
-CREATE OR REPLACE VIEW ops.v_last_run_new_products AS
+DROP VIEW IF EXISTS ops.v_last_run_new_products;
+CREATE VIEW ops.v_last_run_new_products AS
 SELECT c.stock_code, c.standard_description, p.category,
        regexp_replace(c.batches, '[^;]*/', '', 'g') AS batches
 FROM ops.product_change_log c
@@ -617,14 +627,38 @@ ORDER BY c.stock_code;
 -- =========================================================================
 CALL ops.weekly_update(NULL);
 
+-- 运行完自动显示：被标记批次里每一条有问题的行（结果在下方的 Data Output；没有问题时为空）
+--   日期不够新 / 没有任何有效行 / 处理失败：列出整个批次；in_fact 显示这一行是否已经在事实表里
+--   新编码有多个描述 / 已有商品描述不同：只列出这个商品的行
+SELECT regexp_replace(r.file, '^.*/', '')   AS file,
+       i.issue,
+       r.invoice, r.stock_code, r.description, r.quantity, r.price,
+       r.invoice_date, r.customer_id, r.country,
+       CASE WHEN EXISTS (
+              SELECT 1 FROM mart.fact_sales f
+              WHERE f.invoice = r.invoice
+                AND f.stock_code = upper(btrim(r.stock_code))
+                AND coalesce(f.customer_id, '') = coalesce(r.customer_id, '')
+                AND f.invoice_date = r.invoice_date
+                AND f.quantity = r.quantity
+                AND f.price = r.price)
+            THEN '已在事实表' ELSE '不在事实表' END AS in_fact
+FROM ops.batch_issues i
+JOIN raw.load_log   l ON l.file = i.file AND l.sheet = i.sheet
+JOIN raw.sales_lines r ON r.file = i.file AND r.sheet = i.sheet
+WHERE l.status = 'flagged'
+  AND (i.stock_code IS NULL                                  -- 日期不够新 / 没有任何有效行 / 处理失败：列出整个批次
+       OR upper(btrim(r.stock_code)) = i.stock_code)         -- 商品描述问题：只列出这个商品的行
+ORDER BY file, i.issue, r.invoice_date, r.invoice;
+
 
 -- =========================================================================
 -- 7. 批次被标记时（选中要运行的那一行，按 F5 只运行选中的部分）
 --    先看问题，查清原因、和上游或商品负责人确认后再处理。每条命令都必须写说明，时间自动记录
 -- =========================================================================
--- SELECT * FROM ops.v_open_issues;                                          -- 问题明细（full_path 列是完整路径）
+-- 问题行在运行后自动显示；按问题汇总看：SELECT * FROM ops.v_open_issues;（full_path 列是完整路径）
 -- SELECT ops.set_product_name('编码', '名称', '谁确认的、为什么这样定');      -- 新编码补名称，或已有商品改名
--- SELECT ops.confirm_batch('完整路径', '查到的原因和处理方式');               -- 确认批次
+-- SELECT ops.confirm_batch('完整路径', '查到的原因和处理方式');               -- 确认：这批数据可以加载
 -- CALL ops.weekly_update(NULL);                                             -- 不带文件再运行，加载已确认的批次
 
 
